@@ -231,6 +231,7 @@ async def shutdown(display):
 async def _cleanup_error(display):
     from lib.epd import EPD_RST_PIN
     display._panel_monochrome = False
+    display._panel_has_red = True  # unknown after a failure
     try:
         await aio.wait_for(shutdown(display), 15)
     except Exception as error:
@@ -266,7 +267,10 @@ async def grayscale_update(display, black_left, gray_left, black_right, gray_rig
         raise ValueError("Three-tone grayscale does not support selector 11")
     waveform = gray_waveform(display)
     white = bytearray(HALF_BYTES)
-    needs_cleanup = not display._panel_monochrome
+    # The full-waveform clean-up (~35 s) is only for red, which the gray waveform
+    # can't remove. The Refresh Lab (2026-11-12) showed it doesn't otherwise make the
+    # gray result any cleaner: the six white preparation pulls below do that job.
+    needs_cleanup = getattr(display, "_panel_has_red", not display._panel_monochrome)
     display._panel_monochrome = False
     try:
         if needs_cleanup:
@@ -284,6 +288,7 @@ async def grayscale_update(display, black_left, gray_left, black_right, gray_rig
         raise
     await _finish(display)
     display._panel_monochrome = True
+    display._panel_has_red = False
 
 
 async def mixed_update(display, black_left, red_left, black_right, red_right):

@@ -398,6 +398,9 @@ class PartialEPD:
             raise PanelError("partial refresh is only known to work on the B1 panel")
         while d._framebuffer_ready.is_set() or not d.is_done_updating():
             await aio.sleep_ms(50)
+        forget = getattr(d, "forget_panel", None)
+        if forget is not None:  # the stock driver must not skip its next refresh
+            forget()
         wipe = True
         if clean_red and _any(d._framebuffer_red, _PLANE):   # nothing fast removes red
             print("epd_partial: red on the panel, running a normal refresh first")

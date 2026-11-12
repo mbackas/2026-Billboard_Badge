@@ -126,6 +126,26 @@ def _fast_split_and_reverse(src_fb: ptr8, dst_left: ptr8, dst_right: ptr8, lut: 
             dst_right[dst_row + c] = lut[src_fb[src_row + 60 + c]]
 
 
+def _buf(data):
+    """SPI can send bytes-like data as is; only lists need converting (no 40 KB copies)."""
+    return data if isinstance(data, (bytes, bytearray, memoryview)) else bytes(data)
+
+
+@micropython.viper
+def _reverse_copy(src: ptr8, dst: ptr8, lut: ptr8, n: int):
+    for i in range(n):
+        dst[i] = lut[src[i]]
+
+
+# Start-up waits in ms: before reset, reset high, reset low, reset high again,
+# after 0x05 7D, after 0x05 00, waveform-load strobe high, strobe low.
+# STOCK is Pervasive Displays' reference driver. QUICK is lib/epd_partial.py's,
+# which badge os found works on the B1 panel; the Refresh Lab (2026-11-12) showed
+# identical pictures with it and 1.65 s less per refresh.
+_STOCK_WAITS = (200, 20, 200, 200, 200, 10, 100, 100)
+_QUICK_WAITS = (0, 2, 4, 20, 50, 1, 2, 10)
+
+
 @micropython.viper
 def _fast_split_no_reverse(src_fb: ptr8, dst_left: ptr8, dst_right: ptr8):
     for r in range(672):
@@ -184,6 +204,18 @@ class EPaperDisplay:
         self._render_mixed = False
         # E-paper keeps its image across reboot; its initial pigments are unknown.
         self._panel_monochrome = False
+        # Red may be on the panel. Only the panel's own (full) waveform removes red,
+        # so gray updates clean up first only while this is True.
+        self._panel_has_red = True
+        # Start-up waits: quick on the B1 panel (see _QUICK_WAITS), stock otherwise.
+        self._waits = _QUICK_WAITS if self._reverse_fb_bits else _STOCK_WAITS
+        # The last frame run() put on the panel, so an identical one can be skipped.
+        # _last_mode is (grayscale, mixed), or None when the panel's contents are
+        # unknown: before the first refresh, after a failed one, or after another
+        # driver (lib/epd_partial.py) drew on it. Those call forget_panel().
+        self._last_mode = None
+        self._last_planes = None
+        self._rev_buf = None  # scratch plane for _send_images' bit reversal
         self._png_blink = False
         self._refreshing_hw = False
 
@@ -377,6 +409,16 @@ class EPaperDisplay:
                     )
                 print("Viper split & reverse ms:", time.ticks_diff(time.ticks_ms(), t0))
 
+                mode = (grayscale, mixed)
+                if self._same_as_last(mode, black_left, red_left, black_right, red_right):
+                    # The panel already shows exactly this: a refresh would only
+                    # flash for ~35 s (60 s for gray) and change nothing.
+                    print("EPD: frame unchanged, refresh skipped")
+                    if not self._framebuffer_ready.is_set():
+                        self._display_updated.set()
+                    continue
+                self._remember(black_left, red_left, black_right, red_right)
+
                 leds.clear()
                 self._refreshing_hw = True
                 _blink_task = aio.create_task(self._blink_red_while_refreshing())
@@ -395,21 +437,50 @@ class EPaperDisplay:
                                 black_left, red_left, black_right, red_right, grayscale=grayscale)
                 except BaseException:
                     self._panel_monochrome = False
+                    self._panel_has_red = True
                     raise
                 finally:
                     self._reverse_fb_bits = old_rev
                     self._refreshing_hw = False
                     await aio.sleep_ms(50)
+                self._last_mode = mode
 
-                leds[0] = (0, 40, 0)
-                leds.write()
-                await aio.sleep_ms(400)
-                leds.clear()
-
-                gc.collect()
+                # Done first: the green LED and gc used to hold this back ~0.7 s.
                 if not self._framebuffer_ready.is_set():
                     self._display_updated.set()
+                leds[0] = (0, 40, 0)
+                leds.write()
+                aio.create_task(self._led_off_later())
+                gc.collect()
             await aio.sleep_ms(50)
+
+    async def _led_off_later(self):
+        await aio.sleep_ms(400)
+        if not self._refreshing_hw:
+            leds.clear()
+
+    def forget_panel(self):
+        """Something other than run() drew on the panel: never skip the next refresh."""
+        self._last_mode = None
+
+    def _same_as_last(self, mode, black_left, red_left, black_right, red_right):
+        last = self._last_planes
+        return (
+            self._last_mode == mode
+            and last is not None
+            and last[0] == black_left
+            and last[1] == red_left
+            and last[2] == black_right
+            and last[3] == red_right
+        )
+
+    def _remember(self, black_left, red_left, black_right, red_right):
+        """Copy the frame about to be sent (mixed_update edits its planes in place)."""
+        self._last_mode = None  # until the refresh succeeds
+        if self._last_planes is None:
+            self._last_planes = [bytearray(half_frame_one_color_size) for _ in range(4)]
+        for keep, plane in zip(self._last_planes, (black_left, red_left, black_right, red_right)):
+            keep[:] = plane
 
     async def global_update(
         self,
@@ -427,6 +498,7 @@ class EPaperDisplay:
         # Keep the ordinary three-color sequence and overlapping-plane behavior.
         has_red = any(red_left) or any(red_right)
         self._panel_monochrome = False
+        self._panel_has_red = True  # unknown until this finishes
         print("Updating display to new image")
         await self._reset()
         tick = time.ticks_ms()
@@ -444,47 +516,49 @@ class EPaperDisplay:
         tock = time.ticks_ms()
         print(tock - tick)
         self._panel_monochrome = not has_red
+        self._panel_has_red = has_red
 
     async def cog_initial(self):
+        w = self._waits
         self._send_index_data(0x05, [0x7D])
-        await aio.sleep_ms(200)
+        await aio.sleep_ms(w[4])
         self._send_index_data(0x05, [0x00])
-        await aio.sleep_ms(10)
+        await aio.sleep_ms(w[5])
         self._send_index_data(0xD8, [0x80])  # MS_SYNC)
         self._send_index_data(0xD6, [0x00])  # BVSS
         self._send_index_data(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[6])
         self._send_index_data(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[7])
         self._send_index_data(0x03, [0x00, 0x11])  # OSC
 
         # Display 1
         self._send_index_data_left(0x44, [0x00])
         self._send_index_data_left(0x45, [0x80])
         self._send_index_data_left(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[6])
         self._send_index_data_left(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[7])
         self._send_index_data_left(0x44, [0x06])
         self._send_index_data_left(0x45, [0x82])  # Temperature 0x82@25C
         self._send_index_data_left(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[6])
         self._send_index_data_left(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[7])
 
         # Display 2
         self._send_index_data_right(0x44, [0x00])
         self._send_index_data_right(0x45, [0x80])
         self._send_index_data_right(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[6])
         self._send_index_data_right(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[7])
         self._send_index_data_right(0x44, [0x06])
         self._send_index_data_right(0x45, [0x82])  # Temperature 0x82@25C
         self._send_index_data_right(0xA7, [0x10])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[6])
         self._send_index_data_right(0xA7, [0x00])
-        await aio.sleep_ms(100)
+        await aio.sleep_ms(w[7])
 
         self._send_index_data(0x60, [0x25])  # TCON
         self._send_index_data_left(0x61, [0x01])  # STV_DIR for Display 1
@@ -513,7 +587,7 @@ class EPaperDisplay:
         EPD_DC_PIN.value(True)
         EPD_CS1_PIN.value(False)
         EPD_CS2_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(_buf(data))
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(True)
 
@@ -525,7 +599,7 @@ class EPaperDisplay:
         EPD_CS1_PIN.value(True)
         EPD_DC_PIN.value(True)
         EPD_CS1_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(_buf(data))
         EPD_CS1_PIN.value(True)
 
     def _send_index_data_right(self, index: int, data: bytes | list | memoryview[int]):
@@ -536,24 +610,25 @@ class EPaperDisplay:
         EPD_CS2_PIN.value(True)
         EPD_DC_PIN.value(True)
         EPD_CS2_PIN.value(False)
-        self.spi.write(bytes(data))
+        self.spi.write(_buf(data))
         EPD_CS2_PIN.value(True)
 
     async def _display_refresh(self):
         while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+            await aio.sleep_ms(10)
         self._send_index_data(0x15, [0x3C])
         await aio.sleep_ms(5)
 
     async def _reset(self):
         """CoG driver power-on hard reset"""
-        await aio.sleep_ms(200)
+        w = self._waits
+        await aio.sleep_ms(w[0])
         EPD_RST_PIN.value(True)
-        await aio.sleep_ms(20)
+        await aio.sleep_ms(w[1])
         EPD_RST_PIN.value(False)
-        await aio.sleep_ms(200)
+        await aio.sleep_ms(w[2])
         EPD_RST_PIN.value(True)
-        await aio.sleep_ms(200)
+        await aio.sleep_ms(w[3])
         EPD_CS1_PIN.value(True)
         EPD_CS2_PIN.value(True)
         await aio.sleep_ms(5)
@@ -571,25 +646,30 @@ class EPaperDisplay:
         assert len(black_right) == half_frame_one_color_size
         assert len(red_right) == half_frame_one_color_size
 
-        if self._reverse_fb_bits:
-            black_left = bytes(reverse_byte(b) for b in black_left)
-            red_left = bytes(reverse_byte(b) for b in red_left)
-            black_right = bytes(reverse_byte(b) for b in black_right)
-            red_right = bytes(reverse_byte(b) for b in red_right)
-
         # DUW for both left and right halves
         self._send_index_data(0x13, [0x00, 0x3B, 0x00, 0x00, 0x9F, 0x02])
         # DRFW for Both left and right halves
         self._send_index_data(0x90, [0x00, 0x3B, 0x00, 0xA9])
         ram_rw_data = [0x3B, 0x00, 0x14]
         self._send_index_data_left(0x12, ram_rw_data)  # RAM_RW for left half
-        self._send_index_data_left(0x10, black_left)  # Black frame for left half
+        self._send_index_data_left(0x10, self._plane(black_left))  # Black frame for left half
         self._send_index_data_left(0x12, ram_rw_data)  # RAM_RW for left half
-        self._send_index_data_left(0x11, red_left)  # Red frame for left half
+        self._send_index_data_left(0x11, self._plane(red_left))  # Red frame for left half
         self._send_index_data_right(0x12, ram_rw_data)  # RAM_RW for right half
-        self._send_index_data_right(0x10, black_right)  # black frame for right half
+        self._send_index_data_right(0x10, self._plane(black_right))  # black frame for right half
         self._send_index_data_right(0x12, ram_rw_data)  # RAM_RW for right half
-        self._send_index_data_right(0x11, red_right)  # Red frame for right half
+        self._send_index_data_right(0x11, self._plane(red_right))  # Red frame for right half
+
+    def _plane(self, data):
+        """A plane as the panel takes it. On B1 every byte's bits are reversed:
+        viper with a lookup table, ~17 ms a plane. The Python generator this
+        replaces took ~1.08 s a plane (Refresh Lab), 4.3 s per _send_images."""
+        if not self._reverse_fb_bits:
+            return data
+        if self._rev_buf is None:
+            self._rev_buf = bytearray(half_frame_one_color_size)
+        _reverse_copy(data, self._rev_buf, _REVERSE_LUT, half_frame_one_color_size)
+        return self._rev_buf  # sent before the next plane reuses it
 
     async def _dcdc_soft_start(self):
         """DC-DC soft-start command
@@ -631,13 +711,13 @@ class EPaperDisplay:
         Specific to mid-sized EPDs only
         """
         while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+            await aio.sleep_ms(10)
         self._send_index_data(0x09, [0x7F])
         self._send_index_data(0x05, [0x7D])
         self._send_index_data(0x09, [0x00])
         await aio.sleep_ms(200)
         while not EPD_BUSY1_PIN.value() and not EPD_BUSY2_PIN.value():
-            await aio.sleep_ms(100)
+            await aio.sleep_ms(10)
         EPD_DC_PIN.value(False)
         EPD_CS1_PIN.value(False)
         EPD_RST_PIN.value(False)
