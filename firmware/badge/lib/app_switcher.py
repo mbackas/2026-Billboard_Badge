@@ -72,6 +72,16 @@ class AppSwitcher:
         apps_db.close()
         apps_file.close()
 
+        # An app with autostart = True opens at power-up instead of the menu
+        # (Menu +/- still leads to the others).
+        for idx, app in enumerate(self.apps):
+            if getattr(app, "autostart", False):
+                print(f"Starting {app.name} (autostart)")
+                self.active_idx = self.selection_idx = idx
+                app.launched = True
+                self.selecting_mode = False
+                break
+
 
     async def arun(self):
         while True:
